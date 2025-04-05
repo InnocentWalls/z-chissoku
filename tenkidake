@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+
+import time
+import schedule
+import requests
+import json
+import logging
+import os
+from datetime import datetime
+from bme280 import BME280
+from smbus2 import SMBus
+
+# スクリプトのディレクトリを取得
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(os.path.dirname(SCRIPT_DIR), "enviro_slack_bot.log")
+
+# ログ設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("enviro-slack-bot")
+
+# Slack設定
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/"  # ここにSlackのWebhook URLを入力
+SLACK_CHANNEL = "#z-chissoku"  # 投稿先のチャンネル名
+
+
+# センサー初期化
+bus = SMBus(1)
+bme280 = BME280(i2c_dev=bus)
+
+def get_sensor_data():
+    """センサーから温度、気圧、湿度のデータを取得"""
+    try:
+        # 安定した値を得るために、複数回測定して最新の値を使用
+        # 最初の測定値は捨てる（初期値が不安定なため）
+        bme280.get_temperature()
+        bme280.get_pressure()
+        bme280.get_humidity()
+        
+        # 少し待機
+        time.sleep(2)
+        
+        # 実際の測定（2回目）
+        temperature_raw = bme280.get_temperature()
+        pressure = bme280.get_pressure()
+        humidity = bme280.get_humidity()
+        
+        # 温度の補正（CPU熱の影響を補正）
+        # 現在の測定値25.3℃、実際の室温21.6℃の差を計算
+        temperature_offset = -3.7  # 25.3 - 21.6 = 3.7℃ 高く出ているため、マイナス補正
+        temperature = temperature_raw + temperature_offset
+        
+        return {
+            "temperature": f"{temperature:.2f}",
+            "temperature_raw": f"{temperature_raw:.2f}",  # 補正前の値も記録
+            "pressure": f"{pressure:.2f}",
+            "humidity": f"{humidity:.2f}"
+        }
+    except Exception as e:
+        logger.error(f"センサーデータ取得エラー: {e}")
+        return None
+
+def post_to_slack(data):
+    """Slackにデータを投稿"""
+    if data is None:
+        return
+    
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Slack用のメッセージを作成
+    message = {
+        "channel": SLACK_CHANNEL,
+        "username": "環境センサーボット",
+        "icon_emoji": ":thermometer:",
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "環境センサー測定結果"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*測定時刻:*\n{now}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*場所:*\nyojiの机付近"
+                    }
+                ]
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*温度(補正済):*\n{data['temperature']} °C"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*湿度:*\n{data['humidity']} %"
+                    }
+                ]
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*気圧:*\n{data['pressure']} hPa"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*温度(生値):*\n{data['temperature_raw']} °C"
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(message),
+            headers={"Content-Type": "application/json"}
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Slack APIエラー: {response.status_code}, {response.text}")
+        else:
+            logger.info("Slackに環境データを送信しました")
+    except Exception as e:
+        logger.error(f"Slack送信エラー: {e}")
+
+def job():
+    """定期実行されるジョブ"""
+    logger.info("環境データ測定を開始します")
+    data = get_sensor_data()
+    if data:
+        post_to_slack(data)
+        logger.info(f"補正済温度: {data['temperature']}°C (生値: {data['temperature_raw']}°C), 湿度: {data['humidity']}%, 気圧: {data['pressure']}hPa")
+    else:
+        logger.error("センサーデータが取得できませんでした")
+
+def main():
+    logger.info("環境センサーSlackボットを開始します")
+
+    # スケジュール設定
+    schedule.every().day.at("09:00").do(job)
+    schedule.every().day.at("12:00").do(job)
+    schedule.every().day.at("15:00").do(job)
+    schedule.every().day.at("18:00").do(job)
+    
+    # 起動時に一度実行（テスト用）
+    # センサーを初期化するために最初に数回読み取る
+    logger.info("センサーを初期化しています...")
+    for _ in range(3):
+        bme280.get_temperature()
+        bme280.get_pressure()
+        bme280.get_humidity()
+        time.sleep(1)
+    
+    job()
+    
+    # スケジュールループ
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # 1分ごとにスケジュールをチェック
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("ユーザーによる中断")
+    except Exception as e:
+        logger.error(f"予期せぬエラー: {e}")
+    finally:
+        bus.close()
